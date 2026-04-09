@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 sec_fetcher.py — Fetch Item 1.05 Form 8-K material cybersecurity incident filings from SEC EDGAR.
 
@@ -71,7 +72,7 @@ def fetch_item105_filings(start_date: str = RULE_START_DATE) -> list[dict]:
             "dateRange": "custom",
             "startdt": start_date,
             "from": from_index,
-            "hits.hits.total.value": page_size,
+            "size": page_size,
         }
         resp = _get(EDGAR_SEARCH_URL, params=params)
         data = resp.json()
@@ -82,20 +83,38 @@ def fetch_item105_filings(start_date: str = RULE_START_DATE) -> list[dict]:
 
         for hit in hits:
             source = hit.get("_source", {})
+
+            # Skip amendments (8-K/A) — only want original disclosures
+            if source.get("form", "") == "8-K/A":
+                continue
+
+            # Only include filings that actually list item 1.05
+            items = source.get("items", [])
+            if "1.05" not in items:
+                continue
+
+            # ciks is a list; find the CIK matching the primary equity ticker
+            # (skip operating partnerships, preferred share classes, etc.)
+            ciks = source.get("ciks", [])
+            if not ciks:
+                continue
+            cik = str(ciks[0]).zfill(10)
+
+            # adsh is the accession number with dashes (e.g. "0001234567-24-000001")
+            adsh = source.get("adsh", "")
+
             filings.append({
-                "accession": source.get("file_date", "").replace("-", "") + "-" + hit.get("_id", ""),
-                "accession_raw": hit.get("_id", ""),
-                "cik": str(source.get("entity_id", "")).zfill(10),
+                "accession_raw": adsh,
+                "cik": cik,
                 "company_edgar": source.get("display_names", [""])[0] if source.get("display_names") else "",
                 "filing_date": source.get("file_date", ""),
-                "form_type": source.get("form_type", ""),
-                "file_url": source.get("file_url", ""),
-                "period_of_report": source.get("period_of_report", ""),
+                "form_type": source.get("form", ""),
+                "period_of_report": source.get("period_ending", ""),
             })
 
         from_index += len(hits)
         total = data.get("hits", {}).get("total", {}).get("value", 0)
-        print(f"  Fetched {from_index}/{total} filings...")
+        print(f"  Fetched {from_index}/{total} raw hits ({len(filings)} qualifying Item 1.05 8-Ks)...")
 
         if from_index >= total:
             break
@@ -194,7 +213,13 @@ def enrich_filings(filings: list[dict], ticker_map: dict) -> list[dict]:
             print(f"  No ticker for CIK {cik} ({f['company_edgar']}) — skipping")
             continue
 
-        f["ticker"] = ticker_info["ticker"]
+        ticker = ticker_info["ticker"]
+        # Skip warrants (W suffix), preferred shares (- separator), and other non-common instruments
+        if "-" in ticker or ticker.endswith("W") or ticker.endswith("U") or len(ticker) > 5:
+            print(f"  Skipping non-common ticker {ticker} — likely preferred/warrant")
+            continue
+
+        f["ticker"] = ticker
         f["company"] = ticker_info["company"]
 
         # Fetch incident description

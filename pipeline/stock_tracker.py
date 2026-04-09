@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 stock_tracker.py — Track stock price performance around SEC cybersecurity incident disclosures.
 

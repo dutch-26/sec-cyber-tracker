@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 tenk_analyzer.py — Find each company's most recent 10-K before a given incident date,
 extract Item 1A (Risk Factors) text, and use Claude to analyze whether the incident

@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 main.py — Orchestrates the full SEC Cyber Incident Tracker data pipeline.
 

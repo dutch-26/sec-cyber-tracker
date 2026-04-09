@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 peer_comparator.py — Classify companies by GICS sector + market cap tier,
 build sector ETF proxy peer returns, and compute alpha vs. peers.
