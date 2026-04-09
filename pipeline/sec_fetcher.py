@@ -127,18 +127,41 @@ def fetch_filing_document(accession_raw: str, cik: str) -> str:
     """
     Given a raw accession number (e.g. '0001234567-24-000001') and CIK,
     fetch the primary 8-K document and return its text content.
-    """
-    # Build filing index URL
-    accession_nodash = accession_raw.replace("-", "")
-    index_url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}&type=8-K&dateb=&owner=include&count=40"
 
-    # Direct approach: fetch the filing index
-    index_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_nodash}/{accession_raw}-index.htm"
+    Uses the EDGAR submissions JSON to find the primary document name
+    (same reliable approach used for 10-K lookups).
+    """
+    accession_nodash = accession_raw.replace("-", "")
+    cik_int = int(cik)
+
+    # Method 1: EDGAR submissions API — most reliable
+    try:
+        subs_url = EDGAR_SUBMISSIONS_URL.format(cik=cik)
+        data = _get(subs_url).json()
+        filings = data.get("filings", {}).get("recent", {})
+        accessions = filings.get("accessionNumber", [])
+        primary_docs = filings.get("primaryDocument", [])
+
+        for i, acc in enumerate(accessions):
+            if acc == accession_raw:
+                primary_doc = primary_docs[i]
+                doc_url = (
+                    f"https://www.sec.gov/Archives/edgar/data/"
+                    f"{cik_int}/{accession_nodash}/{primary_doc}"
+                )
+                doc_resp = _get(doc_url)
+                return BeautifulSoup(doc_resp.text, "lxml").get_text(separator="\n", strip=True)
+    except Exception:
+        pass
+
+    # Method 2: HTML filing index fallback
+    index_url = (
+        f"https://www.sec.gov/Archives/edgar/data/"
+        f"{cik_int}/{accession_nodash}/{accession_raw}-index.htm"
+    )
     try:
         resp = _get(index_url)
         soup = BeautifulSoup(resp.text, "lxml")
-
-        # Find the primary document link (8-K form)
         for row in soup.find_all("tr"):
             cells = row.find_all("td")
             if len(cells) >= 4:
@@ -148,8 +171,7 @@ def fetch_filing_document(accession_raw: str, cik: str) -> str:
                     if link and link.get("href"):
                         doc_url = "https://www.sec.gov" + link["href"]
                         doc_resp = _get(doc_url)
-                        doc_soup = BeautifulSoup(doc_resp.text, "lxml")
-                        return doc_soup.get_text(separator="\n", strip=True)
+                        return BeautifulSoup(doc_resp.text, "lxml").get_text(separator="\n", strip=True)
     except Exception:
         pass
 

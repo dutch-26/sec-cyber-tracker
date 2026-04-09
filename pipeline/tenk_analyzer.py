@@ -183,8 +183,8 @@ def analyze_with_claude(item_1a_text: str, incident_description: str, client: an
         "risk_types_disclosed": [],
         "incident_type": "unknown",
         "predicted": False,
-        "confidence": 0.0,
-        "analysis": "Analysis unavailable.",
+        "prediction_confidence": 0.0,
+        "prediction_analysis": "Analysis unavailable.",
     }
 
     if not item_1a_text or not incident_description:
