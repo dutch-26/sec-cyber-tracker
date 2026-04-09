@@ -2,22 +2,24 @@ from __future__ import annotations
 """
 sec_fetcher.py — Fetch Item 1.05 Form 8-K material cybersecurity incident filings from SEC EDGAR.
 
-Queries the EDGAR full-text search API for all Item 1.05 filings since Dec 18, 2023
-(the effective date of the SEC cybersecurity disclosure rule), resolves company tickers,
-and extracts incident description text.
+Discovery strategy: iterates the full SEC company_tickers.json (~8K US public companies) and
+queries each company's EDGAR submissions history for 8-Ks tagged with item 1.05. This is
+authoritative vs. EDGAR's full-text search (EFTS), which has confirmed indexing gaps — e.g.,
+AT&T's July 2024 breach filing (73M records) was absent from EFTS despite being in EDGAR.
+
+Runtime: ~20 min for the full historical scan (8K CIKs × SEC rate limit).
+Incremental runs pass a more recent start_date and exit each company's history early.
 """
 
 import time
 import requests
 from bs4 import BeautifulSoup
 
-HEADERS = {"User-Agent": "sec-cyber-tracker research@example.com"}  # SEC requires a User-Agent
-EDGAR_SEARCH_URL = "https://efts.sec.gov/LATEST/search-index"
+HEADERS = {"User-Agent": "sec-cyber-tracker research@example.com"}
 EDGAR_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
-EDGAR_FILING_BASE = "https://www.sec.gov/Archives/edgar"
 COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 
-# Rule effective date
+# Rule effective date — Dec 18, 2023 for large/accelerated filers
 RULE_START_DATE = "2023-12-18"
 
 
@@ -25,11 +27,11 @@ def _get(url: str, params: dict = None, retries: int = 3) -> requests.Response:
     """GET with retry and rate-limit courtesy delay."""
     for attempt in range(retries):
         try:
-            resp = requests.get(url, headers=HEADERS, params=params, timeout=15)
+            resp = requests.get(url, headers=HEADERS, params=params, timeout=20)
             resp.raise_for_status()
-            time.sleep(0.15)  # Stay well under SEC's 10 req/s limit
+            time.sleep(0.11)  # Stay under SEC's 10 req/s limit
             return resp
-        except requests.HTTPError as e:
+        except requests.HTTPError:
             if resp.status_code == 429 and attempt < retries - 1:
                 time.sleep(2 ** attempt)
                 continue
@@ -37,124 +39,177 @@ def _get(url: str, params: dict = None, retries: int = 3) -> requests.Response:
     raise RuntimeError(f"Failed to fetch {url} after {retries} attempts")
 
 
+def _ticker_quality(ticker: str) -> int:
+    """
+    Score a ticker for how likely it is to be the primary common equity.
+    Lower score = better. Used to pick the best ticker when a CIK has
+    multiple entries (e.g. AT&T: T / TBB / T-PA / T-PC).
+    """
+    if "-" in ticker:
+        return 10   # Preferred share series (dash separator)
+    if ticker.endswith("W"):
+        return 9    # Warrant
+    if ticker.endswith("U"):
+        return 8    # Unit
+    if ticker.endswith("R"):
+        return 7    # Rights
+    if len(ticker) > 5:
+        return 5    # Unusually long ticker
+    return len(ticker)  # Prefer shorter common-stock tickers (T < TBB < GOOGL)
+
+
 def build_ticker_map() -> dict:
     """
-    Returns {cik_str (zero-padded 10 digits): ticker} from SEC company_tickers.json.
-    Also returns a reverse map for convenience.
+    Returns {cik (zero-padded 10 digits): {"ticker": str, "company": str}}
+    from SEC company_tickers.json (~8K US public companies).
+
+    When a CIK has multiple entries (preferred shares, warrants, dual-class),
+    picks the entry most likely to be the primary common equity using
+    _ticker_quality scoring (lower = better common stock signal).
     """
     data = _get(COMPANY_TICKERS_URL).json()
-    # SEC format: {"0": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc."}, ...}
-    ticker_map = {}
+    ticker_map: dict = {}
+    scores: dict = {}   # cik → current best score
+
     for entry in data.values():
         cik_padded = str(entry["cik_str"]).zfill(10)
-        ticker_map[cik_padded] = {
-            "ticker": entry["ticker"],
-            "company": entry["title"],
-        }
+        ticker = entry["ticker"]
+        score = _ticker_quality(ticker)
+
+        if cik_padded not in ticker_map or score < scores[cik_padded]:
+            ticker_map[cik_padded] = {"ticker": ticker, "company": entry["title"]}
+            scores[cik_padded] = score
+
     return ticker_map
 
 
-def fetch_item105_filings(start_date: str = RULE_START_DATE) -> list[dict]:
+def fetch_item105_filings(start_date: str = RULE_START_DATE, ticker_map: dict = None) -> list[dict]:
     """
-    Fetch all Item 1.05 8-K filings from EDGAR full-text search.
-    Returns a list of raw filing metadata dicts.
+    Comprehensive discovery: scan every company in the SEC ticker map for Item 1.05
+    8-K filings since start_date using the EDGAR submissions API.
+
+    The submissions API is authoritative — it exposes the `items` metadata field
+    that EDGAR uses internally to classify filings. EDGAR's full-text search (EFTS)
+    has known indexing gaps and misses roughly 50% of actual Item 1.05 disclosures.
+
+    Each company gets exactly one API call. The recent filings array is sorted
+    newest-first, so we break as soon as we pass start_date.
+
+    Returns a list of raw filing dicts (not yet enriched with ticker/price data).
     """
-    filings = []
-    from_index = 0
-    page_size = 100
+    if ticker_map is None:
+        ticker_map = build_ticker_map()
 
-    print(f"Fetching Item 1.05 8-K filings from {start_date}...")
+    cik_list = sorted(ticker_map.keys())
+    total = len(cik_list)
+    filings: list[dict] = []
+    errors = 0
 
-    while True:
-        params = {
-            "q": '"Item 1.05"',
-            "forms": "8-K",
-            "dateRange": "custom",
-            "startdt": start_date,
-            "from": from_index,
-            "size": page_size,
-        }
-        resp = _get(EDGAR_SEARCH_URL, params=params)
-        data = resp.json()
+    print(f"Scanning {total:,} company submission histories for Item 1.05 8-Ks since {start_date}...")
 
-        hits = data.get("hits", {}).get("hits", [])
-        if not hits:
-            break
+    for idx, cik in enumerate(cik_list):
+        if idx > 0 and idx % 500 == 0:
+            print(f"  [{idx:,}/{total:,}] {len(filings)} qualifying filings found so far...")
 
-        for hit in hits:
-            source = hit.get("_source", {})
+        try:
+            data = _get(EDGAR_SUBMISSIONS_URL.format(cik=cik)).json()
+        except Exception:
+            errors += 1
+            continue
 
-            # Skip amendments (8-K/A) — only want original disclosures
-            if source.get("form", "") == "8-K/A":
+        recent = data.get("filings", {}).get("recent", {})
+        forms = recent.get("form", [])
+        dates = recent.get("filingDate", [])
+        accessions = recent.get("accessionNumber", [])
+        items_all = recent.get("items", [])
+        primary_docs = recent.get("primaryDocument", [])
+        report_dates = recent.get("reportDate", [])
+
+        company_name = data.get("name", ticker_map[cik]["company"])
+
+        for i, (form, date, accession) in enumerate(zip(forms, dates, accessions)):
+            # recent[] is newest-first — safe to stop once past our start date
+            if date < start_date:
+                break
+
+            # Only original 8-Ks (not 8-K/A amendments)
+            if form != "8-K":
                 continue
 
-            # Only include filings that actually list item 1.05
-            items = source.get("items", [])
-            if "1.05" not in items:
-                continue
+            # Check items metadata — typically a comma-separated string "1.05,9.01"
+            items_raw = items_all[i] if i < len(items_all) else ""
+            if isinstance(items_raw, list):
+                items_str = ",".join(str(v) for v in items_raw)
+            else:
+                items_str = str(items_raw)
 
-            # ciks is a list; find the CIK matching the primary equity ticker
-            # (skip operating partnerships, preferred share classes, etc.)
-            ciks = source.get("ciks", [])
-            if not ciks:
+            if "1.05" not in items_str:
                 continue
-            cik = str(ciks[0]).zfill(10)
-
-            # adsh is the accession number with dashes (e.g. "0001234567-24-000001")
-            adsh = source.get("adsh", "")
 
             filings.append({
-                "accession_raw": adsh,
+                "accession_raw": accession,
                 "cik": cik,
-                "company_edgar": source.get("display_names", [""])[0] if source.get("display_names") else "",
-                "filing_date": source.get("file_date", ""),
-                "form_type": source.get("form", ""),
-                "period_of_report": source.get("period_ending", ""),
+                "company_edgar": company_name,
+                "filing_date": date,
+                "form_type": form,
+                "period_of_report": report_dates[i] if i < len(report_dates) else "",
+                # Store primary doc for efficient document fetch; stripped before saving
+                "_primary_doc": primary_docs[i] if i < len(primary_docs) else "",
             })
 
-        from_index += len(hits)
-        total = data.get("hits", {}).get("total", {}).get("value", 0)
-        print(f"  Fetched {from_index}/{total} raw hits ({len(filings)} qualifying Item 1.05 8-Ks)...")
+    filings.sort(key=lambda x: x["filing_date"], reverse=True)
 
-        if from_index >= total:
-            break
-
+    if errors:
+        print(f"  Warning: {errors} CIKs had submission API errors (skipped)")
     print(f"Total Item 1.05 8-K filings found: {len(filings)}")
     return filings
 
 
-def fetch_filing_document(accession_raw: str, cik: str) -> str:
+def fetch_filing_document(accession_raw: str, cik: str, primary_doc: str = None) -> str:
     """
-    Given a raw accession number (e.g. '0001234567-24-000001') and CIK,
-    fetch the primary 8-K document and return its text content.
+    Fetch the primary 8-K document and return its full text content.
 
-    Uses the EDGAR submissions JSON to find the primary document name
-    (same reliable approach used for 10-K lookups).
+    Uses primary_doc if provided (already known from the submissions API discovery call),
+    avoiding a redundant second lookup. Falls back to re-querying submissions API, then
+    HTML index parsing.
     """
     accession_nodash = accession_raw.replace("-", "")
     cik_int = int(cik)
 
-    # Method 1: EDGAR submissions API — most reliable
+    # Method 1: direct URL when primary_doc is already known
+    if primary_doc:
+        try:
+            doc_url = (
+                f"https://www.sec.gov/Archives/edgar/data/"
+                f"{cik_int}/{accession_nodash}/{primary_doc}"
+            )
+            resp = _get(doc_url)
+            return BeautifulSoup(resp.text, "lxml").get_text(separator="\n", strip=True)
+        except Exception:
+            pass
+
+    # Method 2: re-query submissions API to find primary doc
     try:
-        subs_url = EDGAR_SUBMISSIONS_URL.format(cik=cik)
-        data = _get(subs_url).json()
-        filings = data.get("filings", {}).get("recent", {})
-        accessions = filings.get("accessionNumber", [])
-        primary_docs = filings.get("primaryDocument", [])
+        data = _get(EDGAR_SUBMISSIONS_URL.format(cik=cik)).json()
+        recent = data.get("filings", {}).get("recent", {})
+        accessions = recent.get("accessionNumber", [])
+        docs = recent.get("primaryDocument", [])
 
         for i, acc in enumerate(accessions):
             if acc == accession_raw:
-                primary_doc = primary_docs[i]
-                doc_url = (
-                    f"https://www.sec.gov/Archives/edgar/data/"
-                    f"{cik_int}/{accession_nodash}/{primary_doc}"
-                )
-                doc_resp = _get(doc_url)
-                return BeautifulSoup(doc_resp.text, "lxml").get_text(separator="\n", strip=True)
+                doc = docs[i] if i < len(docs) else ""
+                if doc:
+                    doc_url = (
+                        f"https://www.sec.gov/Archives/edgar/data/"
+                        f"{cik_int}/{accession_nodash}/{doc}"
+                    )
+                    resp = _get(doc_url)
+                    return BeautifulSoup(resp.text, "lxml").get_text(separator="\n", strip=True)
+                break
     except Exception:
         pass
 
-    # Method 2: HTML filing index fallback
+    # Method 3: HTML filing index fallback
     index_url = (
         f"https://www.sec.gov/Archives/edgar/data/"
         f"{cik_int}/{accession_nodash}/{accession_raw}-index.htm"
@@ -164,14 +219,12 @@ def fetch_filing_document(accession_raw: str, cik: str) -> str:
         soup = BeautifulSoup(resp.text, "lxml")
         for row in soup.find_all("tr"):
             cells = row.find_all("td")
-            if len(cells) >= 4:
-                doc_type = cells[3].get_text(strip=True)
-                if doc_type in ("8-K", "8-K/A"):
-                    link = cells[2].find("a")
-                    if link and link.get("href"):
-                        doc_url = "https://www.sec.gov" + link["href"]
-                        doc_resp = _get(doc_url)
-                        return BeautifulSoup(doc_resp.text, "lxml").get_text(separator="\n", strip=True)
+            if len(cells) >= 4 and cells[3].get_text(strip=True) in ("8-K", "8-K/A"):
+                link = cells[2].find("a")
+                if link and link.get("href"):
+                    doc_url = "https://www.sec.gov" + link["href"]
+                    resp = _get(doc_url)
+                    return BeautifulSoup(resp.text, "lxml").get_text(separator="\n", strip=True)
     except Exception:
         pass
 
@@ -181,17 +234,16 @@ def fetch_filing_document(accession_raw: str, cik: str) -> str:
 def extract_incident_description(filing_text: str) -> str:
     """
     Extract the Item 1.05 section text from an 8-K document.
-    Returns the relevant text block (up to ~2000 chars).
+    Returns the relevant text block, capped at 2500 chars.
     """
     if not filing_text:
         return ""
 
     text_lower = filing_text.lower()
 
-    # Find Item 1.05 section
-    markers = ["item 1.05", "item\xa01.05"]
+    # Find Item 1.05 start (handle non-breaking space variant)
     start = -1
-    for marker in markers:
+    for marker in ["item 1.05", "item\xa01.05"]:
         idx = text_lower.find(marker)
         if idx != -1:
             start = idx
@@ -200,23 +252,22 @@ def extract_incident_description(filing_text: str) -> str:
     if start == -1:
         return ""
 
-    # Find end: next Item heading or reasonable cutoff
-    end_markers = ["item 2.", "item 3.", "item 4.", "item 5.", "item 6.", "item 7.", "item 8.", "item 9."]
+    # Find end at next Item heading
     end = len(filing_text)
-    for em in end_markers:
+    for em in ["item 2.", "item 3.", "item 4.", "item 5.",
+               "item 6.", "item 7.", "item 8.", "item 9."]:
         idx = text_lower.find(em, start + 50)
         if idx != -1 and idx < end:
             end = idx
 
     excerpt = filing_text[start:end].strip()
-    # Cap at 2500 chars for storage
     return excerpt[:2500] if len(excerpt) > 2500 else excerpt
 
 
 def enrich_filings(filings: list[dict], ticker_map: dict) -> list[dict]:
     """
-    Add ticker and incident description to each filing record.
-    Skips filings where no ticker can be resolved (foreign privates, etc.).
+    Add ticker and incident description to each filing.
+    Skips non-resolvable CIKs and non-common-stock instruments.
     """
     enriched = []
     for f in filings:
@@ -224,10 +275,10 @@ def enrich_filings(filings: list[dict], ticker_map: dict) -> list[dict]:
         ticker_info = ticker_map.get(cik)
 
         if not ticker_info:
-            # Try without zero-padding (some CIKs are inconsistent)
-            cik_int = str(int(cik))
+            # Fuzzy match for inconsistent zero-padding
+            cik_stripped = str(int(cik))
             for k, v in ticker_map.items():
-                if k.lstrip("0") == cik_int:
+                if k.lstrip("0") == cik_stripped:
                     ticker_info = v
                     break
 
@@ -236,7 +287,7 @@ def enrich_filings(filings: list[dict], ticker_map: dict) -> list[dict]:
             continue
 
         ticker = ticker_info["ticker"]
-        # Skip warrants (W suffix), preferred shares (- separator), and other non-common instruments
+        # Skip warrants (W suffix), preferred shares (- separator), other non-common instruments
         if "-" in ticker or ticker.endswith("W") or ticker.endswith("U") or len(ticker) > 5:
             print(f"  Skipping non-common ticker {ticker} — likely preferred/warrant")
             continue
@@ -244,10 +295,12 @@ def enrich_filings(filings: list[dict], ticker_map: dict) -> list[dict]:
         f["ticker"] = ticker
         f["company"] = ticker_info["company"]
 
-        # Fetch incident description
-        print(f"  Fetching filing text: {f['ticker']} ({f['filing_date']})")
+        # Pop internal field before saving
+        primary_doc = f.pop("_primary_doc", None)
+
+        print(f"  Fetching filing text: {ticker} ({f['filing_date']})")
         try:
-            filing_text = fetch_filing_document(f["accession_raw"], cik)
+            filing_text = fetch_filing_document(f["accession_raw"], cik, primary_doc=primary_doc)
             f["incident_description"] = extract_incident_description(filing_text)
         except Exception as e:
             print(f"    Warning: could not fetch filing text: {e}")
@@ -268,7 +321,7 @@ def fetch_all_incidents(start_date: str = RULE_START_DATE) -> list[dict]:
     ticker_map = build_ticker_map()
     print(f"Loaded ticker map: {len(ticker_map)} companies")
 
-    filings = fetch_item105_filings(start_date)
+    filings = fetch_item105_filings(start_date, ticker_map)
     enriched = enrich_filings(filings, ticker_map)
 
     print(f"Enriched {len(enriched)} incidents with ticker + description")
